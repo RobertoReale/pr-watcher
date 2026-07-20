@@ -22,14 +22,20 @@
   DraftDir + LATEST.md with the exact text it published, so you can edit or delete anything
   you disagree with.
 
-  NOTE: keep this file pure ASCII. Windows PowerShell 5.1 (used only for the toast) reads .ps1
-  as ANSI, and non-ASCII characters corrupt the parse.
+  CROSS-PLATFORM: pwsh 7 runs on both. -Install registers a Windows Task Scheduler task (logon
+  trigger, needed for the toast) or, on Linux, a "systemctl --user" timer. The desktop toast
+  uses WinRT via Windows PowerShell 5.1 on Windows, or "notify-send" on Linux if present;
+  otherwise it just logs a warning and relies on watch.log / LATEST.md. A rate-limit backoff is
+  a plain marker file (postponed_until.txt), not a scheduler edit, so it works the same on both.
+
+  NOTE: keep this file pure ASCII. Windows PowerShell 5.1 (used only for the Windows toast)
+  reads .ps1 as ANSI, and non-ASCII characters corrupt the parse.
 
   Usage:
-    pwsh -File watch.ps1 -ConfigPath .\my-project.config.json -WhatIf
-    pwsh -File watch.ps1 -ConfigPath .\my-project.config.json -Install
-    pwsh -File watch.ps1 -ConfigPath .\my-project.config.json -TestToast
-    pwsh -File watch.ps1 -ConfigPath .\my-project.config.json -Uninstall
+    pwsh -File watch.ps1 -ConfigPath ./my-project.config.json -WhatIf
+    pwsh -File watch.ps1 -ConfigPath ./my-project.config.json -Install
+    pwsh -File watch.ps1 -ConfigPath ./my-project.config.json -TestToast
+    pwsh -File watch.ps1 -ConfigPath ./my-project.config.json -Uninstall
 #>
 [CmdletBinding()]
 param(
@@ -62,7 +68,8 @@ $ProjectDir   = Req 'projectDir'
 $TaskName     = Req 'taskName'
 
 $WatchDir     = if ($Config.watchDir) { $Config.watchDir } else {
-    Join-Path $env:LOCALAPPDATA ("pr-watch\" + ($TaskName -replace '[^a-zA-Z0-9]+', '-'))
+    $base = if ($IsWindows) { $env:LOCALAPPDATA } else { Join-Path $HOME '.local/share' }
+    Join-Path $base (Join-Path 'pr-watch' ($TaskName -replace '[^a-zA-Z0-9]+', '-'))
 }
 $IntervalMin  = if ($Config.intervalMinutes) { [int]$Config.intervalMinutes } else { 20 }
 $MainPR       = if ($Config.mainPR) { [int]$Config.mainPR } else { $null }
@@ -95,20 +102,10 @@ function Write-Log($msg) {
     Write-Output $line
 }
 
-# --- install / uninstall -------------------------------------------------------------------
-function Stop-Watching([string]$why) {
-    Write-Log "RETIRING: $why"
-    try {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-        Write-Log "Scheduled task '$TaskName' removed. Nothing will run again."
-    } catch {
-        Write-Log "WARN: could not remove the scheduled task ($($_.Exception.Message))"
-    }
-}
+# --- install / uninstall (platform-specific scheduler) -------------------------------------
+function Get-UnitSlug { ($TaskName -replace '[^a-zA-Z0-9]+', '-').Trim('-').ToLower() }
 
-if ($Uninstall) { Stop-Watching 'requested manually (-Uninstall)'; exit 0 }
-
-if ($Install) {
+function Install-Windows {
     $enginePath = Join-Path $PSScriptRoot 'watch.ps1'
     $action  = New-ScheduledTaskAction -Execute 'pwsh.exe' `
         -Argument "-File `"$enginePath`" -ConfigPath `"$ConfigPath`""
@@ -119,16 +116,90 @@ if ($Install) {
         -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Settings $settings -RunLevel Limited -Force | Out-Null
-    Write-Log "Installed scheduled task '$TaskName', every $IntervalMin min, logon-triggered (Interactive: needed for the toast)."
+    Write-Log "Installed Windows scheduled task '$TaskName', every $IntervalMin min, logon-triggered (Interactive: needed for the toast)."
+}
+
+function Uninstall-Windows {
+    try {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+        Write-Log "Windows scheduled task '$TaskName' removed. Nothing will run again."
+    } catch {
+        Write-Log "WARN: could not remove the scheduled task ($($_.Exception.Message))"
+    }
+}
+
+function Install-Linux {
+    $unit     = Get-UnitSlug
+    $userDir  = Join-Path $HOME '.config/systemd/user'
+    New-Item -ItemType Directory -Force -Path $userDir | Out-Null
+    $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    if (-not $pwshPath) { $pwshPath = 'pwsh' }
+    $enginePath = Join-Path $PSScriptRoot 'watch.ps1'
+
+    @"
+[Unit]
+Description=pr-watcher: $TaskName
+
+[Service]
+Type=oneshot
+ExecStart=$pwshPath -File "$enginePath" -ConfigPath "$ConfigPath"
+"@ | Set-Content -Path (Join-Path $userDir "pr-watcher-$unit.service") -Encoding utf8
+
+    @"
+[Unit]
+Description=pr-watcher timer: $TaskName
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${IntervalMin}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"@ | Set-Content -Path (Join-Path $userDir "pr-watcher-$unit.timer") -Encoding utf8
+
+    & systemctl --user daemon-reload
+    & systemctl --user enable --now "pr-watcher-$unit.timer"
+    Write-Log "Installed systemd --user timer 'pr-watcher-$unit.timer', every $IntervalMin min."
+    Write-Log "NOTE: toasts need 'notify-send' (libnotify) and a running session/DBus; otherwise only watch.log/LATEST.md are written."
+}
+
+function Uninstall-Linux {
+    $unit    = Get-UnitSlug
+    $userDir = Join-Path $HOME '.config/systemd/user'
+    try {
+        & systemctl --user disable --now "pr-watcher-$unit.timer" 2>&1 | Out-Null
+        Remove-Item (Join-Path $userDir "pr-watcher-$unit.timer") -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $userDir "pr-watcher-$unit.service") -Force -ErrorAction SilentlyContinue
+        & systemctl --user daemon-reload
+        Write-Log "systemd --user timer 'pr-watcher-$unit.timer' removed. Nothing will run again."
+    } catch {
+        Write-Log "WARN: could not remove the systemd timer ($($_.Exception.Message))"
+    }
+}
+
+function Stop-Watching([string]$why) {
+    Write-Log "RETIRING: $why"
+    if ($IsWindows) { Uninstall-Windows } else { Uninstall-Linux }
+}
+
+if ($Uninstall) { Stop-Watching 'requested manually (-Uninstall)'; exit 0 }
+
+if ($Install) {
+    if ($IsWindows) { Install-Windows } else { Install-Linux }
+    $enginePath = Join-Path $PSScriptRoot 'watch.ps1'
     Write-Output "Installed. Test it with: pwsh -File `"$enginePath`" -ConfigPath `"$ConfigPath`" -WhatIf"
     exit 0
 }
 
 # --- notifications -----------------------------------------------------------------------
-# WinRT toast APIs do not exist in PowerShell 7, so this is delegated to Windows PowerShell 5.1,
-# under an AppID Windows already knows (otherwise it silently drops the toast).
+# WinRT toast APIs do not exist in PowerShell 7, so on Windows this is delegated to Windows
+# PowerShell 5.1, under an AppID Windows already knows (otherwise it silently drops the toast).
+# On Linux it uses notify-send if present; if not, it just logs a warning - the report in
+# LATEST.md and watch.log are the guaranteed record either way.
 function Show-Toast([string]$title, [string]$body) {
-    $script = @"
+    if ($IsWindows) {
+        $script = @"
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
@@ -146,24 +217,54 @@ function Show-Toast([string]$title, [string]$body) {
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(`$AppId).Show(
     [Windows.UI.Notifications.ToastNotification]::new(`$xml))
 "@
-    try {
-        $ps51 = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $b64  = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
-        & $ps51 -NoProfile -EncodedCommand $b64 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { Write-Log 'Toast sent.'; return $true }
-        Write-Log "WARN: toast exited $LASTEXITCODE"
-        return $false
+        try {
+            $ps51 = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $b64  = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+            & $ps51 -NoProfile -EncodedCommand $b64 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { Write-Log 'Toast sent.'; return $true }
+            Write-Log "WARN: toast exited $LASTEXITCODE"
+            return $false
+        }
+        catch {
+            Write-Log "WARN: toast failed ($($_.Exception.Message))"
+            return $false
+        }
     }
-    catch {
-        Write-Log "WARN: toast failed ($($_.Exception.Message))"
+    elseif (Get-Command notify-send -ErrorAction SilentlyContinue) {
+        try {
+            & notify-send -- $title $body
+            if ($LASTEXITCODE -eq 0) { Write-Log 'Toast sent (notify-send).'; return $true }
+            Write-Log "WARN: notify-send exited $LASTEXITCODE"
+            return $false
+        }
+        catch {
+            Write-Log "WARN: notify-send failed ($($_.Exception.Message))"
+            return $false
+        }
+    }
+    else {
+        Write-Log 'WARN: no desktop notification available (notify-send not found). Check watch.log / LATEST.md.'
         return $false
     }
 }
 
 if ($TestToast) {
     $ok = Show-Toast $ProjectLabel 'Test notification. If you can see this, the channel works.'
-    if ($ok) { Write-Log 'TestToast: delivered to Windows. If you cannot see it, check Windows notification settings.' }
+    if ($ok) { Write-Log 'TestToast: delivered. If you cannot see it, check your OS notification settings.' }
     exit 0
+}
+
+# --- rate-limit backoff marker (platform-agnostic: no scheduler edit needed) --------------
+$PostponeFile = Join-Path $WatchDir 'postponed_until.txt'
+if (Test-Path $PostponeFile) {
+    try {
+        $until = [datetime]::Parse((Get-Content $PostponeFile -Raw).Trim(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        if ((Get-Date) -lt $until) {
+            Write-Log "Postponed until $($until.ToString('yyyy-MM-dd HH:mm:ss')) (rate-limit backoff) - skipping this run."
+            exit 0
+        }
+        Remove-Item $PostponeFile -Force -ErrorAction SilentlyContinue
+    } catch { Remove-Item $PostponeFile -Force -ErrorAction SilentlyContinue }
 }
 
 # --- auth -------------------------------------------------------------------------------
@@ -468,22 +569,17 @@ if ($LASTEXITCODE -ne 0 -and (Test-Path $rawLog)) {
 }
 
 if ($null -ne $rateLimitResetsAt -and $rateLimitResetsAt -gt 0) {
-    Write-Log "RATE LIMIT hit! Resets at Unix timestamp $rateLimitResetsAt - rewinding state and postponing task."
+    Write-Log "RATE LIMIT hit! Resets at Unix timestamp $rateLimitResetsAt - rewinding state and postponing."
     $statePreEvent | ConvertTo-Json -Depth 5 | Set-Content -Path $StateFile -Encoding utf8
 
     $epoch = [datetime]'1970-01-01T00:00:00Z'
     $resetUtc = $epoch.AddSeconds($rateLimitResetsAt)
     $newStart = $resetUtc.ToLocalTime().AddMinutes(5)
 
-    try {
-        $t = New-ScheduledTaskTrigger -Once -At ($newStart.ToString('yyyy-MM-ddTHH:mm:ss')) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMin)
-        Set-ScheduledTask -TaskName $TaskName -Trigger $t -Confirm:$false -ErrorAction Stop | Out-Null
-        Write-Log "Scheduled task '$TaskName' auto-postponed to start on $($newStart.ToString('yyyy-MM-dd HH:mm:ss')) ($IntervalMin m repetition)."
-    } catch {
-        Write-Log "WARN: could not auto-postpone scheduled task ($($_.Exception.Message))"
-    }
+    $newStart.ToString('o') | Set-Content -Path $PostponeFile -Encoding utf8
+    Write-Log "Runs will be skipped until $($newStart.ToString('yyyy-MM-dd HH:mm:ss')) via $PostponeFile (the scheduler keeps firing every $IntervalMin min; each run just no-ops until then)."
 
-    Show-Toast $ProjectLabel "Claude hit a rate limit. Task auto-paused until $($newStart.ToString('yyyy-MM-dd HH:mm'))" | Out-Null
+    Show-Toast $ProjectLabel "Claude hit a rate limit. Skipping runs until $($newStart.ToString('yyyy-MM-dd HH:mm'))" | Out-Null
     exit 0
 }
 
@@ -493,13 +589,14 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path $draft)) {
 }
 
 # --- notify -------------------------------------------------------------------------------
+$latestPath = Join-Path $WatchDir 'LATEST.md'
 if (Test-Path $draft) {
     Write-Log "REPORT: $draft"
-    Copy-Item $draft (Join-Path $WatchDir 'LATEST.md') -Force
+    Copy-Item $draft $latestPath -Force
 
     $gist = (Get-Content $draft | Where-Object { $_.Trim() -and $_ -notmatch '^\s*#' } |
              Select-Object -First 1)
-    if (-not $gist) { $gist = "See $WatchDir\LATEST.md" }
+    if (-not $gist) { $gist = "See $latestPath" }
 
     $acted = $gist -match '^\s*ACTION'
     $head  = if ($acted) { "$ProjectLabel : published ($authors)" }
@@ -509,7 +606,7 @@ if (Test-Path $draft) {
     if ($gist.Length -gt 160) { $gist = $gist.Substring(0, 160) + '...' }
 
     Write-Log ("Verdict: " + $(if ($acted) { 'ACTED' } else { 'no action' }) + " - $gist")
-    Show-Toast $head "$gist -- details in $WatchDir\LATEST.md" | Out-Null
+    Show-Toast $head "$gist -- details in $latestPath" | Out-Null
 }
 else {
     Write-Log 'WARN: Claude ran but produced no report file.'
