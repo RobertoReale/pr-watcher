@@ -1,0 +1,27 @@
+{
+  "projectLabel": "My Project PR Watch",
+  "repo": "some-org/some-repo",
+  "githubUser": "your-github-username",
+  "seedThreads": [123, 456],
+  "discoveryQueries": [
+    "repo:some-org/some-repo is:open some-keyword in:title,body"
+  ],
+  "briefPath": "c:/path/to/your/project/PROJECT_BRIEF.md",
+  "projectDir": "c:/path/to/your/project",
+  "watchDir": null,
+  "taskName": "PR Watch - My Project",
+  "intervalMinutes": 20,
+  "mainPR": null,
+  "graceDays": 14,
+  "endOfMissionReminder": null,
+  "tokenEnvVar": "GH_TOKEN",
+  "tokenFile": null,
+  "allowedTools": [
+    "Read", "Write", "Edit", "Glob", "Grep", "Bash", "WebFetch", "WebSearch", "TodoWrite",
+    "mcp__github__pull_request_read", "mcp__github__issue_read",
+    "mcp__github__get_file_contents", "mcp__github__list_commits", "mcp__github__get_commit",
+    "mcp__github__search_pull_requests", "mcp__github__search_issues", "mcp__github__search_code",
+    "mcp__github__add_issue_comment", "mcp__github__add_reply_to_pull_request_comment",
+    "mcp__github__add_comment_to_pending_review", "mcp__github__pull_request_review_write"
+  ]
+}

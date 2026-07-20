@@ -1,0 +1,6 @@
+*.config.json
+!examples/example.config.json
+*.log
+*.jsonl
+drafts/
+LATEST.md
