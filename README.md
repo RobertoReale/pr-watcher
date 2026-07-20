@@ -24,26 +24,36 @@ undo what it published.
 
 ## Setup
 
-1. Copy `examples/example.config.json` to your own file (keep it outside this repo if it has to
-   reference private paths - the path itself is fine to commit, secrets are not).
-2. Fill in `repo`, `githubUser`, `seedThreads`, `briefPath`, `projectDir`, `taskName`.
-3. Write the brief at `briefPath`: what the mission is, what's been said so far, what counts as
-   "our turn to move" for this specific case, and the project's own rules of evidence/voice.
-   This engine only encodes the generic gates (see `engine/prompt.template.txt`); everything
-   mission-specific belongs in the brief, which Claude reads before deciding anything.
-4. Make sure a GitHub token is available where the config's `tokenEnvVar` (default `GH_TOKEN`)
-   points, with enough scope to read the repo and, if you grant those tools, comment/push.
-5. Test without side effects:
-   ```
-   pwsh -File engine\watch.ps1 -ConfigPath path\to\your.config.json -WhatIf
-   pwsh -File engine\watch.ps1 -ConfigPath path\to\your.config.json -TestToast
-   ```
-6. Install the recurring task:
-   ```
-   pwsh -File engine\watch.ps1 -ConfigPath path\to\your.config.json -Install
-   ```
-   The task is registered as **Interactive** (logon-triggered), which is required for the toast
-   to be able to show at all.
+Fastest path - run the wizard:
+
+```
+pwsh -File init.ps1
+```
+
+It asks the handful of questions this needs answered (repo, GitHub user, seed threads, where the
+brief lives - offering to create a blank one for you - working directory, poll interval, how
+much autonomy to grant), and writes the config JSON for you. Then:
+
+```
+pwsh -File engine\watch.ps1 -ConfigPath your.config.json -WhatIf      # dry run, no side effects
+pwsh -File engine\watch.ps1 -ConfigPath your.config.json -TestToast   # check notifications
+pwsh -File engine\watch.ps1 -ConfigPath your.config.json -Install     # start watching for real
+```
+
+Before that last step, fill in the brief the wizard created for you (or your own):
+what the mission is, what's been said so far, what counts as "our turn to move" for this
+specific case, and any project-specific rules of evidence/voice. The engine only encodes the
+generic gates (see `engine/prompt.template.txt`); everything mission-specific belongs in the
+brief, which Claude reads before deciding anything.
+
+Manual path (skip the wizard): copy `examples/example.config.json`, fill in the fields yourself
+(see the table below), and run the same three commands. Either way, make sure a GitHub token is
+available where the config's `tokenEnvVar` (default `GH_TOKEN`) points, with enough scope to
+read the repo and, if you grant those tools, comment/push.
+
+On Windows, `-Install` registers a Task Scheduler task marked **Interactive** (logon-triggered),
+required for the toast to show at all. On Linux, it registers a `systemctl --user` timer, and
+toasts use `notify-send` if installed.
 
 ## Config fields
 
