@@ -132,6 +132,9 @@ $config = [ordered]@{
     endOfMissionReminder = $endReminder
     tokenEnvVar          = $tokenEnvVar
     tokenFile            = $tokenFile
+    # Keeps the launched `claude` on the subscription login even if an API key happens to be in
+    # the environment. Set to false in the config if you want this billed to the metered API.
+    useSubscriptionOnly  = $true
     allowedTools         = $allowedTools
 }
 

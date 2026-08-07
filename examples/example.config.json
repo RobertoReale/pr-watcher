@@ -16,6 +16,8 @@
   "endOfMissionReminder": null,
   "tokenEnvVar": "GH_TOKEN",
   "tokenFile": null,
+  "useSubscriptionOnly": true,
+  "apiTimeoutSeconds": 30,
   "allowedTools": [
     "Read", "Write", "Edit", "Glob", "Grep", "Bash", "WebFetch", "WebSearch", "TodoWrite",
     "mcp__github__pull_request_read", "mcp__github__issue_read",

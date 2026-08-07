@@ -28,6 +28,15 @@
   otherwise it just logs a warning and relies on watch.log / LATEST.md. A rate-limit backoff is
   a plain marker file (postponed_until.txt), not a scheduler edit, so it works the same on both.
 
+  UNATTENDED-SAFE. This thing runs for months with nobody looking at it, so every failure mode
+  it has actually hit in production is contained here rather than left to a human to notice:
+  every HTTP call has a timeout and one retry (pwsh's default timeout is INFINITE, and one
+  stalled socket used to hang a run until the scheduler's time limit killed it, blinding the
+  watcher for hours); a thread that throws is skipped instead of taking the rest of the run with
+  it; stored ETags are validated before being sent back, because one malformed value used to
+  poison an endpoint permanently, and the ETags of threads that produced an event are dropped on
+  rollback, otherwise the retry gets a 304 and never re-sees the event it was meant to retry.
+
   NOTE: keep this file pure ASCII. Windows PowerShell 5.1 (used only for the Windows toast)
   reads .ps1 as ANSI, and non-ASCII characters corrupt the parse.
 
@@ -89,6 +98,12 @@ $AllowedTools = if ($Config.allowedTools) { (@($Config.allowedTools) -join ',') 
 $PromptFile   = if ($Config.promptTemplate) { [string]$Config.promptTemplate } else {
     Join-Path $PSScriptRoot 'prompt.template.txt'
 }
+# The `claude` CLI silently prefers an API key over the subscription login when one is present
+# in the environment. A watcher that fires every 20 minutes for months would then quietly run on
+# metered credits. Default: blank those variables for the child process only. Set this to false
+# in the config if you actually mean to bill this to the API (or to Bedrock/Vertex).
+$SubscriptionOnly = if ($null -ne $Config.useSubscriptionOnly) { [bool]$Config.useSubscriptionOnly } else { $true }
+$ApiTimeoutSec    = if ($Config.apiTimeoutSeconds) { [int]$Config.apiTimeoutSeconds } else { 30 }
 
 $StateFile = Join-Path $WatchDir 'state.json'
 $LogFile   = Join-Path $WatchDir 'watch.log'
@@ -282,11 +297,19 @@ $H = @{
     'User-Agent'           = 'pr-watcher'
 }
 
+# Every HTTP call MUST carry -TimeoutSec. PowerShell 7's default is *infinite*: a single stalled
+# connection hangs the whole run, and because the scheduler refuses overlapping instances, every
+# run after it is skipped until the execution time limit kills the first one - hours blind, with
+# nothing in watch.log to say so. One retry, because a stall is usually transient.
 function Get-Api($url) {
-    try { return Invoke-RestMethod -Uri $url -Headers $H -Method Get }
-    catch {
-        if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 404) { return $null }
-        throw
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        try { return Invoke-RestMethod -Uri $url -Headers $H -Method Get -TimeoutSec $ApiTimeoutSec }
+        catch {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 404) { return $null }
+            if ($attempt -eq 2) { throw }
+            Write-Log "WARN: $url failed ($($_.Exception.Message)), retry"
+            Start-Sleep -Seconds 3
+        }
     }
 }
 
@@ -296,18 +319,33 @@ function Get-Api($url) {
 # without the polling cost growing with it.
 function Get-ApiCached([string]$url) {
     $headers = $H.Clone()
-    if ($state.etags.ContainsKey($url)) { $headers['If-None-Match'] = $state.etags[$url] }
-    try {
-        $resp = Invoke-WebRequest -Uri $url -Headers $headers -Method Get
-        if ($resp.Headers['ETag']) { $state.etags[$url] = [string]$resp.Headers['ETag'][0] }
-        return [pscustomobject]@{ Data = ($resp.Content | ConvertFrom-Json); Changed = $true }
+    # Only send back a validator that is actually well formed. A truncated one ("W") once got
+    # stored, and .NET then rejected every request to that URL with "The format of value 'W' is
+    # invalid" - forever, because the bad value lived in state.json. A malformed ETag is worth
+    # one uncached 200, never a permanently dead endpoint.
+    if ($state.etags.ContainsKey($url)) {
+        $tag = [string]$state.etags[$url]
+        if ($tag -match '^(W/)?"[^"]*"$') { $headers['If-None-Match'] = $tag }
+        else { $state.etags.Remove($url) }
     }
-    catch {
-        $status = $null
-        if ($_.Exception.Response) { $status = $_.Exception.Response.StatusCode.value__ }
-        if ($status -eq 304) { return [pscustomobject]@{ Data = $null; Changed = $false } }
-        if ($status -eq 404) { return [pscustomobject]@{ Data = $null; Changed = $true } }
-        throw
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        try {
+            $resp = Invoke-WebRequest -Uri $url -Headers $headers -Method Get -TimeoutSec $ApiTimeoutSec
+            # @(...) first: PowerShell hands this header back as a string[] sometimes and as a
+            # bare string others, and indexing [0] into a bare string yields its first CHARACTER,
+            # the "W" of W/"...". That is exactly how the poisoned value above was produced.
+            if ($resp.Headers['ETag']) { $state.etags[$url] = [string](@($resp.Headers['ETag'])[0]) }
+            return [pscustomobject]@{ Data = ($resp.Content | ConvertFrom-Json); Changed = $true }
+        }
+        catch {
+            $status = $null
+            if ($_.Exception.Response) { $status = $_.Exception.Response.StatusCode.value__ }
+            if ($status -eq 304) { return [pscustomobject]@{ Data = $null; Changed = $false } }
+            if ($status -eq 404) { return [pscustomobject]@{ Data = $null; Changed = $true } }
+            if ($attempt -eq 2) { throw }
+            Write-Log "WARN: $url failed ($($_.Exception.Message)), retry"
+            Start-Sleep -Seconds 3
+        }
     }
 }
 
@@ -414,81 +452,107 @@ foreach ($n in ($known | Sort-Object)) {
     $isNew = -not $state.threads.ContainsKey($key)
     $prev  = if ($isNew) { @{ lastComment = 0; head = ''; title = '' } } else { $state.threads[$key] }
 
-    $prUrl = "https://api.github.com/repos/$Repo/pulls/$n"
-    $prRes = Get-ApiCached $prUrl
-    $pr    = $prRes.Data
-    $head  = if (-not $prRes.Changed) { $prev.head }
-             elseif ($pr)             { [string]$pr.head.sha }
-             else                     { '' }
-    $title = if (-not $prRes.Changed) { $prev.title }
-             elseif ($pr)             { [string]$pr.title }
-             else {
-                 $iss = Get-Api "https://api.github.com/repos/$Repo/issues/$n"
-                 if ($iss) { [string]$iss.title } else { $prev.title }
-             }
+    # One bad thread must not take the run down with it. Threads are polled in numeric order, so
+    # without this a single failing URL kills every thread after it, plus the state write and the
+    # Claude launch - and the log shows only a WARN, which reads like a survived hiccup. A thread
+    # that throws keeps its previous state, so the next run retries it from where it was.
+    try {
+        $prUrl = "https://api.github.com/repos/$Repo/pulls/$n"
+        $prRes = Get-ApiCached $prUrl
+        $pr    = $prRes.Data
+        $head  = if (-not $prRes.Changed) { $prev.head }
+                 elseif ($pr)             { [string]$pr.head.sha }
+                 else                     { '' }
+        $title = if (-not $prRes.Changed) { $prev.title }
+                 elseif ($pr)             { [string]$pr.title }
+                 else {
+                     $iss = Get-Api "https://api.github.com/repos/$Repo/issues/$n"
+                     if ($iss) { [string]$iss.title } else { $prev.title }
+                 }
 
-    if (-not $isNew -and $head -and $prev.head -and ($head -ne $prev.head)) {
-        $a = $prev.head.Substring(0, 9)
-        $b = $head.Substring(0, 9)
-        Write-Log "PR #$n HEAD CHANGED $a -> $b"
-        $events += [pscustomobject]@{
-            Kind = 'NEW COMMITS / FORCE-PUSH'; Number = $n; Author = '-'
-            Text = "head $a -> $b : the diff may no longer be what it was"
-            Url  = "https://github.com/$Repo/pull/$n/files"
-        }
-    }
-
-    $comments   = @()
-    $anyChanged = $false
-    foreach ($u in @(
-        "https://api.github.com/repos/$Repo/issues/$n/comments?per_page=100",
-        "https://api.github.com/repos/$Repo/pulls/$n/comments?per_page=100"
-    )) {
-        $r = Get-ApiCached $u
-        if ($r.Changed) { $anyChanged = $true }
-        if ($r.Data) { $comments += $r.Data }
-    }
-
-    $newest = if ($comments) { ($comments | Measure-Object -Property id -Maximum).Maximum } else { $prev.lastComment }
-
-    if ($isNew) {
-        Write-Log "WATCH #$n baseline (comment $newest) - $title"
-    }
-    elseif (-not $anyChanged) {
-        Write-Log "WATCH #$n nothing new (cached)"
-    }
-    else {
-        $fresh = $comments | Where-Object {
-            $_.id -gt $prev.lastComment -and $_.user.login -ne $Me -and $_.user.type -ne 'Bot'
-        }
-        foreach ($c in $fresh) {
-            Write-Log "COMMENT #$n by $($c.user.login) (id $($c.id))"
-            $snippet = ($c.body -replace '\s+', ' ')
-            if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
+        if (-not $isNew -and $head -and $prev.head -and ($head -ne $prev.head)) {
+            $a = $prev.head.Substring(0, 9)
+            $b = $head.Substring(0, 9)
+            Write-Log "PR #$n HEAD CHANGED $a -> $b"
             $events += [pscustomobject]@{
-                Kind = 'COMMENT'; Number = $n; Author = $c.user.login; Text = $snippet; Url = $c.html_url
+                Kind = 'NEW COMMITS / FORCE-PUSH'; Number = $n; Author = '-'
+                Text = "head $a -> $b : the diff may no longer be what it was"
+                Url  = "https://github.com/$Repo/pull/$n/files"
             }
         }
-        if (-not $fresh) { Write-Log "WATCH #$n nothing new" }
-    }
 
-    $prevSeen[$key] = $prev.lastComment
-    $state.threads[$key] = @{ lastComment = $newest; head = $head; title = $title }
+        $comments   = @()
+        $anyChanged = $false
+        foreach ($u in @(
+            "https://api.github.com/repos/$Repo/issues/$n/comments?per_page=100",
+            "https://api.github.com/repos/$Repo/pulls/$n/comments?per_page=100"
+        )) {
+            $r = Get-ApiCached $u
+            if ($r.Changed) { $anyChanged = $true }
+            if ($r.Data) { $comments += $r.Data }
+        }
+
+        $newest = if ($comments) { ($comments | Measure-Object -Property id -Maximum).Maximum } else { $prev.lastComment }
+
+        if ($isNew) {
+            Write-Log "WATCH #$n baseline (comment $newest) - $title"
+        }
+        elseif (-not $anyChanged) {
+            Write-Log "WATCH #$n nothing new (cached)"
+        }
+        else {
+            $fresh = $comments | Where-Object {
+                $_.id -gt $prev.lastComment -and $_.user.login -ne $Me -and $_.user.type -ne 'Bot'
+            }
+            foreach ($c in $fresh) {
+                Write-Log "COMMENT #$n by $($c.user.login) (id $($c.id))"
+                $snippet = ($c.body -replace '\s+', ' ')
+                if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
+                $events += [pscustomobject]@{
+                    Kind = 'COMMENT'; Number = $n; Author = $c.user.login; Text = $snippet; Url = $c.html_url
+                }
+            }
+            if (-not $fresh) { Write-Log "WATCH #$n nothing new" }
+        }
+
+        $prevSeen[$key] = $prev.lastComment
+        $state.threads[$key] = @{ lastComment = $newest; head = $head; title = $title }
+    }
+    catch {
+        Write-Log "ERROR: thread #$n poll failed ($($_.Exception.Message)) - skipped, will retry next run"
+    }
 }
 
+# The state is advanced BEFORE waking Claude, so a comment can never be answered twice. The cost
+# of that choice is the opposite risk: if Claude dies mid-run the comment is already marked seen
+# and would be silently dropped. So keep a snapshot to roll back to on failure, and let the next
+# run retry it.
 $stateBeforeRun = $state | ConvertTo-Json -Depth 5
 if (-not $WhatIf) { $stateBeforeRun | Set-Content -Path $StateFile -Encoding utf8 }
 
 if (-not $events) { exit 0 }
 
-$statePreEvent = @{ threads = @{}; ignore = $state.ignore; mainClosedSeen = $state.mainClosedSeen; etags = $state.etags }
+$statePreEvent = @{ threads = @{}; ignore = $state.ignore; mainClosedSeen = $state.mainClosedSeen; etags = @{} }
+$rewound = @()
 foreach ($k in $state.threads.Keys) {
     $ev = $events | Where-Object { [string]$_.Number -eq $k } | Select-Object -First 1
+    if ($ev) { $rewound += $k }
     $statePreEvent.threads[$k] = @{
+        # rewind only the threads that produced an event, so only those get retried
         lastComment = if ($ev) { $prevSeen[$k] } else { $state.threads[$k].lastComment }
         head        = $state.threads[$k].head
         title       = $state.threads[$k].title
     }
+}
+# Rewinding lastComment alone does nothing: the fresh ETag would make the retry come back 304,
+# the run would log "nothing new (cached)" and the event we meant to retry would be lost for
+# good. Drop the validators of the rewound threads only, so exactly those refetch in full.
+foreach ($u in $state.etags.Keys) {
+    $keep = $true
+    foreach ($k in $rewound) {
+        if ($u -match "/(issues|pulls)/$k(/|\?|$)") { $keep = $false; break }
+    }
+    if ($keep) { $statePreEvent.etags[$u] = $state.etags[$u] }
 }
 
 # --- wake Claude --------------------------------------------------------------------------
@@ -513,7 +577,22 @@ $prompt = $prompt.Replace('{{GITHUB_USER}}', $Me)
 Write-Log "Waking Claude: $($events.Count) event(s) [$authors] -> $draft"
 if ($WhatIf) { Write-Log 'WhatIf: Claude not launched.'; exit 0 }
 
+# Plain `claude -p` prints nothing until it is completely done, which makes a long run look like
+# a hang. --output-format stream-json emits an event per step, so the log carries a live trail of
+# what it is doing (tail watch.log to watch it think). The raw stream is kept for forensics.
 $rawLog = Join-Path $WatchDir "run_$stamp.jsonl"
+
+# See $SubscriptionOnly above: blank these for the child process so an API key sitting in the
+# environment (from a shell profile, a machine-wide setx, another tool) cannot silently move a
+# job that fires every $IntervalMin minutes onto a metered bill. This process is one-shot, so
+# there is nothing to restore.
+if ($SubscriptionOnly) {
+    $env:ANTHROPIC_API_KEY       = $null
+    $env:ANTHROPIC_AUTH_TOKEN    = $null
+    $env:ANTHROPIC_BASE_URL      = $null
+    $env:CLAUDE_CODE_USE_BEDROCK = $null
+    $env:CLAUDE_CODE_USE_VERTEX  = $null
+}
 
 Push-Location $ProjectDir
 try {
@@ -542,8 +621,19 @@ try {
                             }
                         }
                     }
-                    'result' { Write-Log "   == $($o.subtype) (turns: $($o.num_turns), cost: $([math]::Round($o.total_cost_usd,3)) USD)" }
-                    'rate_limit_event' { Write-Log "   !! Rate limit event received (resetsAt: $($o.rate_limit_info.resetsAt))" }
+                    # On a subscription total_cost_usd is what the same tokens WOULD have cost on
+                    # the metered API, not a charge. Read bare, that number looks like a bill.
+                    'result' {
+                        $costNote = if ($SubscriptionOnly) { ' equiv. API, not billed on a subscription' } else { '' }
+                        Write-Log "   == $($o.subtype) (turns: $($o.num_turns), cost: $([math]::Round($o.total_cost_usd,3)) USD$costNote)"
+                    }
+                    'rate_limit_event' {
+                        $ri = $o.rate_limit_info
+                        Write-Log "   !! Rate limit event (status: $($ri.status), overage: $($ri.overageStatus), isUsingOverage: $($ri.isUsingOverage), resetsAt: $($ri.resetsAt))"
+                        # If this ever prints, the run has spilled past the plan onto paid extra
+                        # usage: real money, per token. Loud on purpose.
+                        if ($ri.isUsingOverage) { Write-Log '   !! WARNING: paid extra usage (overage) is active. Turn it off at claude.ai -> Settings -> Billing.' }
+                    }
                 }
             }
             catch { }

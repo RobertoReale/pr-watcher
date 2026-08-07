@@ -76,6 +76,8 @@ toasts use `notify-send` if installed.
 | `tokenFile` | no | fallback file with a `GITHUB_TOKEN: <token>` line |
 | `allowedTools` | no | Claude Code `--allowedTools` list; default is read+comment, no push |
 | `promptTemplate` | no | defaults to `engine/prompt.template.txt` |
+| `useSubscriptionOnly` | no | default `true`: blanks `ANTHROPIC_API_KEY` and friends for the launched `claude` process, so a key sitting in the environment cannot silently bill this to the metered API. Set `false` if you do want API/Bedrock/Vertex billing |
+| `apiTimeoutSeconds` | no | per-request GitHub timeout, default 30 |
 
 ## Commands
 
@@ -84,6 +86,24 @@ toasts use `notify-send` if installed.
 - `-Install` - register the scheduled task.
 - `-Uninstall` - remove it.
 - `-TestToast` - fire a sample notification to prove the channel works.
+
+## Running unattended
+
+This is meant to run for months with nobody watching it, so the failure modes it has actually
+hit in production are handled in the engine rather than left for you to notice:
+
+- **Every request has a timeout and one retry.** PowerShell's default timeout is *infinite*: one
+  stalled socket used to hang a run until the scheduler killed it, and since overlapping runs are
+  refused, that meant hours of silence with nothing in the log to explain it.
+- **A thread that throws is skipped, not fatal.** Threads are polled in numeric order; before
+  this, one bad URL took down every thread after it plus the state write and the Claude launch.
+- **Stored ETags are validated before being sent back.** A malformed one gets discarded instead
+  of poisoning that endpoint permanently.
+- **A rolled-back thread drops its ETags too.** Rewinding the last-seen comment on its own does
+  nothing: the retry would come back 304, log "nothing new (cached)", and lose the event it was
+  supposed to retry.
+- **Billing stays on your subscription** unless you say otherwise (`useSubscriptionOnly`), and
+  the log shouts if a run ever lands on paid extra usage.
 
 ## Notes
 
