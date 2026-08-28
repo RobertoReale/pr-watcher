@@ -575,7 +575,13 @@ $prompt = $prompt.Replace('{{DRAFT_FILE}}', $draft)
 $prompt = $prompt.Replace('{{GITHUB_USER}}', $Me)
 
 Write-Log "Waking Claude: $($events.Count) event(s) [$authors] -> $draft"
-if ($WhatIf) { Write-Log 'WhatIf: Claude not launched.'; exit 0 }
+if ($WhatIf) {
+    # Dump what would have been sent, so -WhatIf can be inspected rather than trusted.
+    $dump = Join-Path $WatchDir 'last_prompt.txt'
+    try { $prompt | Set-Content -Path $dump -Encoding utf8; Write-Log "WhatIf: prompt written to $dump" } catch { }
+    Write-Log 'WhatIf: Claude not launched.'
+    exit 0
+}
 
 # Plain `claude -p` prints nothing until it is completely done, which makes a long run look like
 # a hang. --output-format stream-json emits an event per step, so the log carries a live trail of
@@ -632,6 +638,10 @@ try {
                         Write-Log "   !! Rate limit event (status: $($ri.status), overage: $($ri.overageStatus), isUsingOverage: $($ri.isUsingOverage), resetsAt: $($ri.resetsAt))"
                         # If this ever prints, the run has spilled past the plan onto paid extra
                         # usage: real money, per token. Loud on purpose.
+                        # 'allowed_warning' means the plan window is nearly spent. Not an error,
+                        # the run continues - but it is the last warning before the stream simply
+                        # stops mid-answer. Acted on after the run, below.
+                        if ($ri.status -eq 'allowed_warning') { Write-Log '   !! Usage window nearly spent: if this run dies, the watcher pauses itself.' }
                         if ($ri.isUsingOverage) { Write-Log '   !! WARNING: paid extra usage (overage) is active. Turn it off at claude.ai -> Settings -> Billing.' }
                     }
                 }
@@ -642,40 +652,93 @@ try {
 }
 finally { Pop-Location }
 
-# Auto-postpone if Claude hit the weekly/daily rate limit.
-$rateLimitResetsAt = $null
-if ($LASTEXITCODE -ne 0 -and (Test-Path $rawLog)) {
+# --- usage limits: decide whether to pause --------------------------------------------------
+# Read back what the CLI said about the plan window during this run. Re-parsed from the stream
+# file rather than captured in the pipeline above, because ForEach-Object runs in a child scope
+# and a plain assignment there would not survive.
+$rlStatus  = $null
+$rlResets  = $null
+$rlOverage = $false
+if (Test-Path $rawLog) {
     try {
         foreach ($line in (Get-Content $rawLog -ErrorAction SilentlyContinue)) {
-            if ($line.Trim() -and $line.StartsWith('{')) {
-                $evt = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if ($evt -and $evt.type -eq 'rate_limit_event' -and $evt.rate_limit_info -and $evt.rate_limit_info.status -eq 'rejected' -and $evt.rate_limit_info.resetsAt) {
-                    $rateLimitResetsAt = [int64]$evt.rate_limit_info.resetsAt
-                    break
-                }
-            }
+            if (-not $line.Trim() -or -not $line.StartsWith('{')) { continue }
+            $evt = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if (-not $evt -or $evt.type -ne 'rate_limit_event' -or -not $evt.rate_limit_info) { continue }
+            $ri = $evt.rate_limit_info
+            # keep the most severe status seen in the run, and the most recent reset offered
+            if ($ri.status -eq 'rejected') { $rlStatus = 'rejected' }
+            elseif ($ri.status -eq 'allowed_warning' -and $rlStatus -ne 'rejected') { $rlStatus = 'allowed_warning' }
+            if ($ri.resetsAt) { $rlResets = [int64]$ri.resetsAt }
+            if ($ri.isUsingOverage) { $rlOverage = $true }
         }
     } catch { }
 }
 
-if ($null -ne $rateLimitResetsAt -and $rateLimitResetsAt -gt 0) {
-    Write-Log "RATE LIMIT hit! Resets at Unix timestamp $rateLimitResetsAt - rewinding state and postponing."
+$runFailed = ($LASTEXITCODE -ne 0 -or -not (Test-Path $draft))
+
+# Two reasons to stop, not one. 'rejected' is the window closed in our face. The second is the
+# case that actually keeps happening: the run DIES while the window was flagged as nearly spent.
+# The stream just stops, there is no 'rejected' event to key on, and the plain FAILED path below
+# would retry in $IntervalMin minutes against the same empty budget, and again, and again.
+$pauseWhy = $null
+if ($rlStatus -eq 'rejected') { $pauseWhy = 'usage window exhausted (rejected)' }
+elseif ($runFailed -and $rlStatus -eq 'allowed_warning') { $pauseWhy = 'run died with the usage window nearly spent' }
+
+if ($rlOverage) { Write-Log '!! WARNING: this run consumed PAID extra usage (overage).' }
+
+if ($pauseWhy) {
+    Write-Log "RATE LIMIT: $pauseWhy - rewinding state and pausing."
     $statePreEvent | ConvertTo-Json -Depth 5 | Set-Content -Path $StateFile -Encoding utf8
 
-    $epoch = [datetime]'1970-01-01T00:00:00Z'
-    $resetUtc = $epoch.AddSeconds($rateLimitResetsAt)
-    $newStart = $resetUtc.ToLocalTime().AddMinutes(5)
+    if ($rlResets -and $rlResets -gt 0) {
+        $epoch    = [datetime]'1970-01-01T00:00:00Z'
+        $newStart = $epoch.AddSeconds($rlResets).ToLocalTime().AddMinutes(5)
+        $basis    = 'reset time reported by the CLI'
+    } else {
+        # A stalled stream usually carries no reset time. Back off an hour rather than hammer:
+        # the next run refetches the rewound threads anyway, so waiting costs latency, while
+        # retrying costs budget we do not have.
+        $newStart = (Get-Date).AddHours(1)
+        $basis    = 'no reset reported, 1h backoff'
+    }
+    # A reset in the past, or absurdly far out, means we misread it. Never pause for less than
+    # one normal cycle, never for more than half a day without the user noticing.
+    if ($newStart -lt (Get-Date).AddMinutes($IntervalMin)) { $newStart = (Get-Date).AddMinutes($IntervalMin); $basis += ' (clamped up)' }
+    if ($newStart -gt (Get-Date).AddHours(12))              { $newStart = (Get-Date).AddHours(12);             $basis += ' (clamped down)' }
 
     $newStart.ToString('o') | Set-Content -Path $PostponeFile -Encoding utf8
-    Write-Log "Runs will be skipped until $($newStart.ToString('yyyy-MM-dd HH:mm:ss')) via $PostponeFile (the scheduler keeps firing every $IntervalMin min; each run just no-ops until then)."
-
-    Show-Toast $ProjectLabel "Claude hit a rate limit. Skipping runs until $($newStart.ToString('yyyy-MM-dd HH:mm'))" | Out-Null
+    Write-Log "Runs skipped until $($newStart.ToString('yyyy-MM-dd HH:mm:ss')) via $PostponeFile - $basis."
+    Show-Toast $ProjectLabel "Claude usage limit: pausing until $($newStart.ToString('yyyy-MM-dd HH:mm')). No event lost." | Out-Null
     exit 0
 }
 
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $draft)) {
+# If Claude died (crash, or the scheduler killing it at a time limit) it may not have replied.
+# The event is already marked seen, so without this it would vanish silently. Rewind the affected
+# threads and let the next run pick them up again.
+$failFile = Join-Path $WatchDir 'failstreak.txt'
+if ($runFailed) {
     Write-Log "FAILED run (exit $LASTEXITCODE, report: $(Test-Path $draft)) - rewinding state so the next run retries"
     $statePreEvent | ConvertTo-Json -Depth 5 | Set-Content -Path $StateFile -Encoding utf8
+
+    # A failure with no rate-limit signal at all is usually transient (network, a stalled
+    # response) and worth an immediate retry. A run of them is not: something is wrong that
+    # another $IntervalMin minutes will not fix, and each attempt still spends from the plan
+    # window before it dies. Back off after three.
+    $streak = 0
+    if (Test-Path $failFile) { try { $streak = [int](Get-Content $failFile -Raw).Trim() } catch { $streak = 0 } }
+    $streak++
+    Set-Content -Path $failFile -Value $streak -Encoding ascii
+    Write-Log "Consecutive failed runs: $streak"
+    if ($streak -ge 3) {
+        $until = (Get-Date).AddHours(1)
+        $until.ToString('o') | Set-Content -Path $PostponeFile -Encoding utf8
+        Write-Log "Three failures in a row with no rate-limit signal - skipping runs until $($until.ToString('yyyy-MM-dd HH:mm:ss'))."
+        Show-Toast $ProjectLabel "$streak failed runs in a row: paused until $($until.ToString('HH:mm')). Check the log." | Out-Null
+        Remove-Item $failFile -Force -ErrorAction SilentlyContinue
+    }
+} elseif (Test-Path $failFile) {
+    Remove-Item $failFile -Force -ErrorAction SilentlyContinue
 }
 
 # --- notify -------------------------------------------------------------------------------

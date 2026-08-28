@@ -104,6 +104,19 @@ hit in production are handled in the engine rather than left for you to notice:
   supposed to retry.
 - **Billing stays on your subscription** unless you say otherwise (`useSubscriptionOnly`), and
   the log shouts if a run ever lands on paid extra usage.
+- **Hitting your Claude usage limit pauses the watcher instead of spinning on it.** The obvious
+  half is a `rejected` rate-limit event. The half that actually kept happening is subtler: the
+  window is flagged `allowed_warning`, the run then dies with the stream simply stopping
+  mid-answer, and there is no `rejected` event to key on. That used to fall through to the plain
+  failure path and retry on the next tick against the same empty budget, forever. Both cases now
+  write `postponed_until.txt`; if the CLI gave no reset time the backoff is an hour, clamped to
+  between one poll interval and twelve hours.
+- **Three failed runs in a row pause it too**, even with no rate-limit signal at all. One failure
+  is usually a stalled response and worth retrying immediately; a run of them means something
+  that another interval will not fix, and each attempt still spends from the plan window before
+  it dies.
+- **`-WhatIf` writes the prompt it would have sent** to `last_prompt.txt`, so a dry run can be
+  read rather than trusted.
 
 ## Notes
 
